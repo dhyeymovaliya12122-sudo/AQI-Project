@@ -1,5 +1,8 @@
+import io
 # pyrefly: ignore [missing-import]
 from django.conf import settings
+# pyrefly: ignore [missing-import]
+from django.db.models import F
 # pyrefly: ignore [missing-import]
 from rest_framework import status
 # pyrefly: ignore [missing-import]
@@ -8,6 +11,8 @@ from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 # pyrefly: ignore [missing-import]
 from rest_framework.response import Response
+# pyrefly: ignore [missing-import]
+from PIL import Image
 
 from .models import Report
 from .serializers import ReportSerializer, ReportCreateSerializer, VoteSerializer
@@ -17,6 +22,53 @@ from .utils.exif_check import get_exif_gps
 from .utils.haversine import haversine_km, bounding_box
 # pyrefly: ignore [missing-import]
 from .utils.cloud import upload_to_cloud
+
+# FIX 5 — Decompression bomb protection: reject images exceeding ~5000x5000 pixels
+Image.MAX_IMAGE_PIXELS = 25_000_000
+
+# FIX 6 — Allowed image MIME types (mapped from Pillow format names)
+PILLOW_FORMAT_TO_MIME = {
+    'JPEG': 'image/jpeg',
+    'PNG': 'image/png',
+    'WEBP': 'image/webp',
+    'GIF': 'image/gif',
+}
+ALLOWED_IMAGE_MIMES = set(PILLOW_FORMAT_TO_MIME.values())
+
+
+def _validate_image(image_file):
+    """Validate uploaded image: integrity, bomb protection, and MIME type.
+
+    Returns a Response on failure, or None on success.
+    Resets file pointer after validation so callers can still read the file.
+    """
+    try:
+        image_file.seek(0)
+        img = Image.open(image_file)
+        img.verify()  # checks structural integrity without full decode
+    except Image.DecompressionBombError:
+        # FIX 5 — Image exceeds MAX_IMAGE_PIXELS
+        return Response(
+            {'success': False, 'error': 'Image dimensions exceed allowed limits.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    except Exception:
+        # FIX 4 — Corrupted, disguised, or malformed image
+        return Response(
+            {'success': False, 'error': 'Invalid image file.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # FIX 6 — MIME type validation using Pillow's magic-byte detection
+    detected_mime = PILLOW_FORMAT_TO_MIME.get(img.format)
+    if detected_mime not in ALLOWED_IMAGE_MIMES:
+        return Response(
+            {'success': False, 'error': 'Unsupported image format.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    image_file.seek(0)
+    return None  # valid
 
 
 @api_view(['GET', 'POST'])
@@ -63,6 +115,11 @@ def _create_report(request):
     image_file = request.FILES.get('image')
 
     if image_file:
+        # FIX 4/5/6 — Validate image before any EXIF or upload processing
+        validation_error = _validate_image(image_file)
+        if validation_error is not None:
+            return validation_error
+
         image_bytes = image_file.read()
         exif_coords = get_exif_gps(image_bytes)
         if exif_coords:
@@ -108,11 +165,13 @@ def vote_report(request, pk):
     if not serializer.is_valid():
         return Response({'success': False, 'errors': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
+    # FIX 1 — Atomic update using F() expressions to prevent lost updates
     if serializer.validated_data['action'] == 'up':
-        report.upvotes += 1
+        Report.objects.filter(pk=pk).update(upvotes=F('upvotes') + 1)
     else:
-        report.downvotes += 1
-    report.save()
+        Report.objects.filter(pk=pk).update(downvotes=F('downvotes') + 1)
+
+    report.refresh_from_db()
     report.check_and_apply_decay()
 
     return Response({'success': True, 'upvotes': report.upvotes, 'downvotes': report.downvotes, 'status': report.status})
@@ -124,6 +183,20 @@ def delete_report(request, pk):
         report = Report.objects.get(pk=pk)
     except Report.DoesNotExist:
         return Response({'success': False, 'error': 'Report not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    # FIX 2 — Authorization checks
+    if request.user.is_authenticated and request.user.is_superuser:
+        # Superusers can delete any report
+        pass
+    elif request.user.is_authenticated:
+        # Authenticated users can only delete their own reports
+        if report.user != request.user:
+            return Response({'success': False, 'error': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
+    else:
+        # Anonymous users can only delete anonymous reports (user is NULL)
+        if report.user is not None:
+            return Response({'success': False, 'error': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
+
     report.status = 'expired'
     report.save(update_fields=['status'])
     return Response({'success': True, 'message': 'Report marked as expired.'})

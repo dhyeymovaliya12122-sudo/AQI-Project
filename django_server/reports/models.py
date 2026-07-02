@@ -7,6 +7,8 @@ from django.contrib.auth.models import User
 from django.utils import timezone
 # pyrefly: ignore [missing-import]
 from django.conf import settings
+# pyrefly: ignore [missing-import]
+from django.core.validators import MinValueValidator, MaxValueValidator
 
 
 def apply_decay(report):
@@ -22,14 +24,14 @@ class Report(models.Model):
     STATUS_CHOICES = [('active', 'Active'), ('expired', 'Expired')]
 
     id          = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    lat         = models.FloatField()
-    lng         = models.FloatField()
+    lat         = models.FloatField(validators=[MinValueValidator(-90), MaxValueValidator(90)])
+    lng         = models.FloatField(validators=[MinValueValidator(-180), MaxValueValidator(180)])
     type        = models.CharField(max_length=20, choices=POLLUTION_TYPES)
-    severity    = models.IntegerField()
+    severity    = models.IntegerField(validators=[MinValueValidator(1), MaxValueValidator(5)])
     description = models.TextField(blank=True, default='')
     image_url   = models.URLField(blank=True, null=True)
-    upvotes     = models.IntegerField(default=0)
-    downvotes   = models.IntegerField(default=0)
+    upvotes     = models.PositiveIntegerField(default=0)
+    downvotes   = models.PositiveIntegerField(default=0)
     status      = models.CharField(max_length=10, choices=STATUS_CHOICES, default='active')
     created_at  = models.DateTimeField(auto_now_add=True)
     user        = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='reports')
